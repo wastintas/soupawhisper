@@ -6,6 +6,7 @@ Hold the hotkey to record, release to transcribe and copy to clipboard.
 
 import argparse
 import configparser
+import json
 import subprocess
 import tempfile
 import threading
@@ -13,6 +14,8 @@ import signal
 import sys
 import os
 import select
+import time
+from datetime import datetime
 from pathlib import Path
 
 import evdev
@@ -23,6 +26,7 @@ __version__ = "0.1.0"
 
 # Load configuration
 CONFIG_PATH = Path.home() / ".config" / "soupawhisper" / "config.ini"
+HISTORY_PATH = Path.home() / ".local" / "share" / "soupawhisper" / "history.jsonl"
 
 
 def load_config():
@@ -111,6 +115,7 @@ class Dictation:
         self.model_error = None
         self.running = True
         self.hotkey_held = False
+        self.record_start_time = None
 
         # Load model in background
         self._start_model_load(self.model_name)
@@ -148,6 +153,19 @@ class Dictation:
             return
         print(f"Switching to {model_name}...")
         self._start_model_load(model_name)
+
+    def save_to_history(self, text):
+        """Save transcription to history file."""
+        duration = round(time.time() - self.record_start_time, 1) if self.record_start_time else 0
+        entry = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "text": text,
+            "model": self.model_name,
+            "duration": duration,
+        }
+        HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(HISTORY_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     def notify(self, title, message, icon="dialog-information", timeout=2000):
         """Send a desktop notification."""
@@ -187,6 +205,7 @@ class Dictation:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
+        self.record_start_time = time.time()
         print("Recording...")
         hotkey_name = ecodes.KEY.get(HOTKEY, str(HOTKEY))
         self.notify("Recording...", f"Release {hotkey_name} when done", "audio-input-microphone", 30000)
@@ -254,6 +273,7 @@ class Dictation:
                         capture_output=True
                     )
 
+                self.save_to_history(text)
                 print(f"Transcribed: {text}")
                 self.notify("Copied!", text[:100] + ("..." if len(text) > 100 else ""), "emblem-ok-symbolic", 3000)
             else:
