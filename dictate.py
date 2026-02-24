@@ -92,34 +92,62 @@ AUTO_TYPE = CONFIG["auto_type"]
 NOTIFICATIONS = CONFIG["notifications"]
 
 
+MODEL_SLOTS = {
+    ecodes.KEY_1: "base",
+    ecodes.KEY_2: "small",
+    ecodes.KEY_3: "medium",
+    ecodes.KEY_4: "large-v3",
+}
+
+
 class Dictation:
     def __init__(self):
         self.recording = False
         self.record_process = None
         self.temp_file = None
         self.model = None
+        self.model_name = MODEL_SIZE
         self.model_loaded = threading.Event()
         self.model_error = None
         self.running = True
+        self.hotkey_held = False
 
         # Load model in background
-        print(f"Loading Whisper model ({MODEL_SIZE})...")
+        self._start_model_load(self.model_name)
+
+    def _start_model_load(self, model_name):
+        self.model_name = model_name
+        self.model = None
+        self.model_error = None
+        self.model_loaded.clear()
+        print(f"Loading Whisper model ({model_name})...")
+        self.notify("Loading model...", f"{model_name}", "emblem-synchronizing", 5000)
         threading.Thread(target=self._load_model, daemon=True).start()
 
     def _load_model(self):
         try:
-            self.model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
+            self.model = WhisperModel(self.model_name, device=DEVICE, compute_type=COMPUTE_TYPE)
             self.model_loaded.set()
             hotkey_name = ecodes.KEY[HOTKEY] if HOTKEY in ecodes.KEY else str(HOTKEY)
-            print(f"Model loaded. Ready for dictation!")
+            print(f"Model loaded: {self.model_name}. Ready!")
             print(f"Hold [{hotkey_name}] to record, release to transcribe.")
+            print(f"Hold [{hotkey_name}] + 1=base, 2=small, 3=medium, 4=large-v3")
             print("Press Ctrl+C to quit.")
+            self.notify("Ready!", f"Model: {self.model_name}", "emblem-ok-symbolic", 3000)
         except Exception as e:
             self.model_error = str(e)
             self.model_loaded.set()
             print(f"Failed to load model: {e}")
             if "cudnn" in str(e).lower() or "cuda" in str(e).lower():
                 print("Hint: Try setting device = cpu in your config, or install cuDNN.")
+
+    def switch_model(self, model_name):
+        if model_name == self.model_name:
+            print(f"Already using {model_name}")
+            self.notify("Model", f"Already using {model_name}", "dialog-information", 2000)
+            return
+        print(f"Switching to {model_name}...")
+        self._start_model_load(model_name)
 
     def notify(self, title, message, icon="dialog-information", timeout=2000):
         """Send a desktop notification."""
@@ -289,11 +317,28 @@ class Dictation:
             for dev in r:
                 try:
                     for event in dev.read():
-                        if event.type == ecodes.EV_KEY and event.code == HOTKEY:
+                        if event.type != ecodes.EV_KEY:
+                            continue
+                        if event.code == HOTKEY:
                             if event.value == 1:  # key down
+                                self.hotkey_held = True
                                 self.start_recording()
                             elif event.value == 0:  # key up
-                                self.stop_recording()
+                                self.hotkey_held = False
+                                if self.recording:
+                                    self.stop_recording()
+                        elif self.hotkey_held and event.value == 1 and event.code in MODEL_SLOTS:
+                            # Hotkey + number = switch model, cancel recording
+                            if self.recording:
+                                self.recording = False
+                                if self.record_process:
+                                    self.record_process.terminate()
+                                    self.record_process.wait()
+                                    self.record_process = None
+                                if self.temp_file and os.path.exists(self.temp_file.name):
+                                    os.unlink(self.temp_file.name)
+                                print("Recording cancelled.")
+                            self.switch_model(MODEL_SLOTS[event.code])
                 except OSError:
                     # Device disconnected
                     keyboards.remove(dev)
