@@ -12,9 +12,11 @@ import threading
 import signal
 import sys
 import os
+import select
 from pathlib import Path
 
-from pynput import keyboard
+import evdev
+from evdev import ecodes
 from faster_whisper import WhisperModel
 
 __version__ = "0.1.0"
@@ -43,6 +45,7 @@ def load_config():
         "model": config.get("whisper", "model", fallback=defaults["model"]),
         "device": config.get("whisper", "device", fallback=defaults["device"]),
         "compute_type": config.get("whisper", "compute_type", fallback=defaults["compute_type"]),
+        "language": config.get("whisper", "language", fallback="auto"),
         "key": config.get("hotkey", "key", fallback=defaults["key"]),
         "auto_type": config.getboolean("behavior", "auto_type", fallback=True),
         "notifications": config.getboolean("behavior", "notifications", fallback=True),
@@ -52,19 +55,36 @@ def load_config():
 CONFIG = load_config()
 
 
-def get_hotkey(key_name):
-    """Map key name to pynput key."""
+def get_hotkey_code(key_name):
+    """Map key name to evdev key code."""
     key_name = key_name.lower()
-    if hasattr(keyboard.Key, key_name):
-        return getattr(keyboard.Key, key_name)
-    elif len(key_name) == 1:
-        return keyboard.KeyCode.from_char(key_name)
-    else:
-        print(f"Unknown key: {key_name}, defaulting to f12")
-        return keyboard.Key.f12
+    # Map common names to evdev key codes
+    key_map = {
+        "f1": ecodes.KEY_F1, "f2": ecodes.KEY_F2, "f3": ecodes.KEY_F3,
+        "f4": ecodes.KEY_F4, "f5": ecodes.KEY_F5, "f6": ecodes.KEY_F6,
+        "f7": ecodes.KEY_F7, "f8": ecodes.KEY_F8, "f9": ecodes.KEY_F9,
+        "f10": ecodes.KEY_F10, "f11": ecodes.KEY_F11, "f12": ecodes.KEY_F12,
+        "alt_r": ecodes.KEY_RIGHTALT, "alt_l": ecodes.KEY_LEFTALT,
+        "ctrl_r": ecodes.KEY_RIGHTCTRL, "ctrl_l": ecodes.KEY_LEFTCTRL,
+        "shift_r": ecodes.KEY_RIGHTSHIFT, "shift_l": ecodes.KEY_LEFTSHIFT,
+        "super_r": ecodes.KEY_RIGHTMETA, "super_l": ecodes.KEY_LEFTMETA,
+        "scroll_lock": ecodes.KEY_SCROLLLOCK, "pause": ecodes.KEY_PAUSE,
+        "insert": ecodes.KEY_INSERT, "home": ecodes.KEY_HOME,
+        "end": ecodes.KEY_END, "page_up": ecodes.KEY_PAGEUP,
+        "page_down": ecodes.KEY_PAGEDOWN,
+        "caps_lock": ecodes.KEY_CAPSLOCK,
+    }
+    if key_name in key_map:
+        return key_map[key_name]
+    # Try evdev KEY_ constant directly
+    attr = f"KEY_{key_name.upper()}"
+    if hasattr(ecodes, attr):
+        return getattr(ecodes, attr)
+    print(f"Unknown key: {key_name}, defaulting to F12")
+    return ecodes.KEY_F12
 
 
-HOTKEY = get_hotkey(CONFIG["key"])
+HOTKEY = get_hotkey_code(CONFIG["key"])
 MODEL_SIZE = CONFIG["model"]
 DEVICE = CONFIG["device"]
 COMPUTE_TYPE = CONFIG["compute_type"]
@@ -90,7 +110,7 @@ class Dictation:
         try:
             self.model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
             self.model_loaded.set()
-            hotkey_name = HOTKEY.name if hasattr(HOTKEY, 'name') else HOTKEY.char
+            hotkey_name = ecodes.KEY[HOTKEY] if HOTKEY in ecodes.KEY else str(HOTKEY)
             print(f"Model loaded. Ready for dictation!")
             print(f"Hold [{hotkey_name}] to record, release to transcribe.")
             print("Press Ctrl+C to quit.")
@@ -140,8 +160,8 @@ class Dictation:
             stderr=subprocess.DEVNULL
         )
         print("Recording...")
-        hotkey_name = HOTKEY.name if hasattr(HOTKEY, 'name') else HOTKEY.char
-        self.notify("Recording...", f"Release {hotkey_name.upper()} when done", "audio-input-microphone", 30000)
+        hotkey_name = ecodes.KEY.get(HOTKEY, str(HOTKEY))
+        self.notify("Recording...", f"Release {hotkey_name} when done", "audio-input-microphone", 30000)
 
     def stop_recording(self):
         if not self.recording:
@@ -167,27 +187,46 @@ class Dictation:
 
         # Transcribe
         try:
+            lang = CONFIG["language"] if CONFIG["language"] != "auto" else None
             segments, info = self.model.transcribe(
                 self.temp_file.name,
                 beam_size=5,
                 vad_filter=True,
+                language=lang,
             )
 
             text = " ".join(segment.text.strip() for segment in segments)
 
             if text:
-                # Copy to clipboard using xclip
-                process = subprocess.Popen(
-                    ["xclip", "-selection", "clipboard"],
-                    stdin=subprocess.PIPE
-                )
-                process.communicate(input=text.encode())
+                # Detect Wayland vs X11
+                is_wayland = os.environ.get("XDG_SESSION_TYPE") == "wayland"
 
-                # Type it into the active input field
+                if is_wayland:
+                    # Copy to clipboard using wl-copy
+                    process = subprocess.Popen(
+                        ["wl-copy"],
+                        stdin=subprocess.PIPE
+                    )
+                    process.communicate(input=text.encode())
+                else:
+                    # Copy to clipboard using xclip
+                    process = subprocess.Popen(
+                        ["xclip", "-selection", "clipboard"],
+                        stdin=subprocess.PIPE
+                    )
+                    process.communicate(input=text.encode())
+
+                # Auto-paste using dotool (works on Wayland/X11)
                 if AUTO_TYPE:
-                    subprocess.run(["xdotool", "type", "--clearmodifiers", text])
+                    import time
+                    time.sleep(0.3)
+                    subprocess.run(
+                        ["dotool"],
+                        input=b"key ctrl+v",
+                        capture_output=True
+                    )
 
-                print(f"Copied: {text}")
+                print(f"Transcribed: {text}")
                 self.notify("Copied!", text[:100] + ("..." if len(text) > 100 else ""), "emblem-ok-symbolic", 3000)
             else:
                 print("No speech detected")
@@ -201,13 +240,33 @@ class Dictation:
             if self.temp_file and os.path.exists(self.temp_file.name):
                 os.unlink(self.temp_file.name)
 
-    def on_press(self, key):
-        if key == HOTKEY:
-            self.start_recording()
-
-    def on_release(self, key):
-        if key == HOTKEY:
-            self.stop_recording()
+    def _find_keyboards(self):
+        """Find keyboard-only input devices, excluding mice/touchpads."""
+        devices = []
+        skip_names = ("mouse", "touchpad", "trackpad", "trackpoint", "touchscreen")
+        for path in evdev.list_devices():
+            dev = evdev.InputDevice(path)
+            name_lower = dev.name.lower()
+            # Skip anything that looks like a mouse/touchpad
+            if any(s in name_lower for s in skip_names):
+                dev.close()
+                continue
+            caps = dev.capabilities()
+            # Skip devices with relative axes (mice)
+            if ecodes.EV_REL in caps:
+                dev.close()
+                continue
+            # Must have keyboard keys
+            if ecodes.EV_KEY in caps:
+                key_codes = caps[ecodes.EV_KEY]
+                # Must have letter keys or F-keys (real keyboard)
+                if ecodes.KEY_A in key_codes and ecodes.KEY_Z in key_codes:
+                    devices.append(dev)
+                else:
+                    dev.close()
+            else:
+                dev.close()
+        return devices
 
     def stop(self):
         print("\nExiting...")
@@ -215,25 +274,44 @@ class Dictation:
         os._exit(0)
 
     def run(self):
-        with keyboard.Listener(
-            on_press=self.on_press,
-            on_release=self.on_release
-        ) as listener:
-            listener.join()
+        keyboards = self._find_keyboards()
+        if not keyboards:
+            print("Error: No keyboard devices found.")
+            print("Make sure your user is in the 'input' group:")
+            print("  sudo usermod -aG input $USER")
+            print("Then log out and back in.")
+            sys.exit(1)
+
+        print(f"Monitoring {len(keyboards)} keyboard device(s): {', '.join(d.name for d in keyboards)}")
+
+        while self.running:
+            r, _, _ = select.select(keyboards, [], [], 1.0)
+            for dev in r:
+                try:
+                    for event in dev.read():
+                        if event.type == ecodes.EV_KEY and event.code == HOTKEY:
+                            if event.value == 1:  # key down
+                                self.start_recording()
+                            elif event.value == 0:  # key up
+                                self.stop_recording()
+                except OSError:
+                    # Device disconnected
+                    keyboards.remove(dev)
 
 
 def check_dependencies():
     """Check that required system commands are available."""
     missing = []
+    is_wayland = os.environ.get("XDG_SESSION_TYPE") == "wayland"
 
-    for cmd in ["arecord", "xclip"]:
-        if subprocess.run(["which", cmd], capture_output=True).returncode != 0:
-            pkg = "alsa-utils" if cmd == "arecord" else cmd
-            missing.append((cmd, pkg))
+    # Audio recording
+    if subprocess.run(["which", "arecord"], capture_output=True).returncode != 0:
+        missing.append(("arecord", "alsa-utils"))
 
-    if AUTO_TYPE:
-        if subprocess.run(["which", "xdotool"], capture_output=True).returncode != 0:
-            missing.append(("xdotool", "xdotool"))
+    # Clipboard tool
+    clip_cmd = "wl-copy" if is_wayland else "xclip"
+    if subprocess.run(["which", clip_cmd], capture_output=True).returncode != 0:
+        missing.append((clip_cmd, clip_cmd))
 
     if missing:
         print("Missing dependencies:")

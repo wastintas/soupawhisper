@@ -108,9 +108,12 @@ ExecStart=$venv_path/bin/python $SCRIPT_DIR/dictate.py
 Restart=on-failure
 RestartSec=5
 
-# X11 display access
+# Display access (X11 and Wayland)
 Environment=DISPLAY=$display
 Environment=XAUTHORITY=$xauthority
+Environment=XDG_RUNTIME_DIR=%t
+Environment=WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}
+Environment=XDG_SESSION_TYPE=${XDG_SESSION_TYPE:-x11}
 
 [Install]
 WantedBy=default.target
