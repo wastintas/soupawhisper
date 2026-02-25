@@ -154,6 +154,31 @@ class Dictation:
         print(f"Switching to {model_name}...")
         self._start_model_load(model_name)
 
+    @staticmethod
+    def apply_voice_commands(text):
+        """Replace voice commands with their corresponding characters."""
+        import re
+        replacements = [
+            (r'\bpróximo item\b', '\n'),
+            (r'\bnova linha\b', '\n'),
+            (r'\bpula linha\b', '\n'),
+            (r'\bparágrafo\b', '\n\n'),
+            (r'\bponto final\b', '.'),
+            (r'\bvírgula\b', ','),
+            (r'\bponto de interrogação\b', '?'),
+            (r'\bponto de exclamação\b', '!'),
+            (r'\bdois pontos\b', ':'),
+            (r'\bponto e vírgula\b', ';'),
+            (r'\babre parênteses\b', '('),
+            (r'\bfecha parênteses\b', ')'),
+        ]
+        for pattern, replacement in replacements:
+            text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+        # Clean up extra spaces around punctuation
+        text = re.sub(r'\s+([.,;:!?)\]])', r'\1', text)
+        text = re.sub(r'([\[(])\s+', r'\1', text)
+        return text.strip()
+
     def save_to_history(self, text):
         """Save transcription to history file."""
         duration = round(time.time() - self.record_start_time, 1) if self.record_start_time else 0
@@ -243,6 +268,7 @@ class Dictation:
             )
 
             text = " ".join(segment.text.strip() for segment in segments)
+            text = self.apply_voice_commands(text)
 
             if text:
                 # Detect Wayland vs X11
@@ -364,6 +390,36 @@ class Dictation:
                     keyboards.remove(dev)
 
 
+def transcribe_file(filepath, output=None, model_override=None):
+    """Transcribe an audio file and print or save the result."""
+    if not os.path.exists(filepath):
+        print(f"Error: File not found: {filepath}")
+        sys.exit(1)
+
+    model_name = model_override or MODEL_SIZE
+    print(f"Loading model ({model_name})...")
+    model = WhisperModel(model_name, device=DEVICE, compute_type=COMPUTE_TYPE)
+
+    print(f"Transcribing: {filepath}")
+    lang = CONFIG["language"] if CONFIG["language"] != "auto" else None
+    segments, info = model.transcribe(
+        filepath,
+        beam_size=5,
+        vad_filter=True,
+        language=lang,
+    )
+
+    text = " ".join(segment.text.strip() for segment in segments)
+    text = Dictation.apply_voice_commands(text)
+
+    if output:
+        with open(output, "w", encoding="utf-8") as f:
+            f.write(text)
+        print(f"Saved to: {output}")
+    else:
+        print(f"\n{text}")
+
+
 def check_dependencies():
     """Check that required system commands are available."""
     missing = []
@@ -394,9 +450,27 @@ def main():
         action="version",
         version=f"SoupaWhisper {__version__}"
     )
-    parser.parse_args()
+    parser.add_argument(
+        "-f", "--file",
+        help="Transcribe an audio file (mp3, wav, m4a, ogg, flac, mp4, etc.)"
+    )
+    parser.add_argument(
+        "-m", "--model",
+        help="Model to use for file transcription (base, small, medium, large-v3)"
+    )
+    parser.add_argument(
+        "-o", "--output",
+        help="Save transcription to a text file instead of printing"
+    )
+    args = parser.parse_args()
 
     print(f"SoupaWhisper v{__version__}")
+
+    # File transcription mode
+    if args.file:
+        transcribe_file(args.file, args.output, args.model)
+        return
+
     print(f"Config: {CONFIG_PATH}")
 
     check_dependencies()
