@@ -10,6 +10,7 @@ import json
 import subprocess
 import tempfile
 import threading
+import traceback
 import signal
 import sys
 import os
@@ -21,6 +22,31 @@ from pathlib import Path
 import evdev
 from evdev import ecodes
 from faster_whisper import WhisperModel
+
+# Tray icon support is lazy-loaded to avoid GTK's setlocale() breaking encoding.
+# Actual imports happen in _init_tray() only when the tray is used.
+Gtk = GLib = AyatanaAppIndicator3 = None
+TRAY_AVAILABLE = False
+
+
+def _init_tray():
+    """Lazy-load GTK/AppIndicator and fix locale after GTK init."""
+    global Gtk, GLib, AyatanaAppIndicator3, TRAY_AVAILABLE
+    import locale
+    try:
+        import gi
+        gi.require_version('Gtk', '3.0')
+        gi.require_version('AyatanaAppIndicator3', '0.1')
+        from gi.repository import Gtk as _Gtk, GLib as _GLib
+        from gi.repository import AyatanaAppIndicator3 as _AI3
+        Gtk, GLib, AyatanaAppIndicator3 = _Gtk, _GLib, _AI3
+        # GTK calls setlocale(LC_ALL, "") which can reset to C/ASCII.
+        # Force it back to UTF-8.
+        locale.setlocale(locale.LC_ALL, 'C.UTF-8')
+        TRAY_AVAILABLE = True
+    except (ImportError, ValueError, locale.Error):
+        TRAY_AVAILABLE = False
+    return TRAY_AVAILABLE
 
 __version__ = "0.1.0"
 
@@ -104,6 +130,84 @@ MODEL_SLOTS = {
 }
 
 
+class TrayIcon:
+    """System tray icon using AyatanaAppIndicator3."""
+
+    def __init__(self, dictation):
+        self.dictation = dictation
+        self.indicator = AyatanaAppIndicator3.Indicator.new(
+            "soupawhisper",
+            "audio-input-microphone-symbolic",
+            AyatanaAppIndicator3.IndicatorCategory.APPLICATION_STATUS
+        )
+        self.indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
+        self.indicator.set_title("SoupaWhisper")
+        self._build_menu()
+
+    def _build_menu(self):
+        menu = Gtk.Menu()
+
+        self.status_item = Gtk.MenuItem(label="Loading...")
+        self.status_item.set_sensitive(False)
+        menu.append(self.status_item)
+
+        self.model_item = Gtk.MenuItem(label=f"Model: {self.dictation.model_name}")
+        self.model_item.set_sensitive(False)
+        menu.append(self.model_item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        models_item = Gtk.MenuItem(label="Switch model")
+        models_menu = Gtk.Menu()
+        for name in ["base", "small", "medium", "large-v3"]:
+            item = Gtk.MenuItem(label=name)
+            item.connect("activate", self._on_model_select, name)
+            models_menu.append(item)
+        models_item.set_submenu(models_menu)
+        menu.append(models_item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        quit_item = Gtk.MenuItem(label="Quit")
+        quit_item.connect("activate", self._on_quit)
+        menu.append(quit_item)
+
+        menu.show_all()
+        self.indicator.set_menu(menu)
+
+    def update(self, state, model=None):
+        """Thread-safe tray update — schedules UI changes on the GTK main loop."""
+        def _do_update():
+            if state == "recording":
+                self.indicator.set_icon_full("media-record-symbolic", "Recording")
+                self.status_item.set_label("Recording...")
+            elif state == "transcribing":
+                self.indicator.set_icon_full("emblem-synchronizing-symbolic", "Transcribing")
+                self.status_item.set_label("Transcribing...")
+            elif state == "ready":
+                self.indicator.set_icon_full("audio-input-microphone-symbolic", "Ready")
+                self.status_item.set_label("Ready")
+            elif state == "loading":
+                self.indicator.set_icon_full("emblem-synchronizing-symbolic", "Loading")
+                self.status_item.set_label("Loading model...")
+            elif state == "error":
+                self.indicator.set_icon_full("dialog-error-symbolic", "Error")
+                self.status_item.set_label("Error")
+            if model:
+                self.model_item.set_label(f"Model: {model}")
+            return False
+        GLib.idle_add(_do_update)
+
+    def _on_model_select(self, widget, model_name):
+        threading.Thread(
+            target=self.dictation.switch_model, args=(model_name,), daemon=True
+        ).start()
+
+    def _on_quit(self, widget):
+        self.dictation.running = False
+        Gtk.main_quit()
+
+
 class Dictation:
     def __init__(self):
         self.recording = False
@@ -116,9 +220,14 @@ class Dictation:
         self.running = True
         self.hotkey_held = False
         self.record_start_time = None
+        self.tray = None
 
         # Load model in background
         self._start_model_load(self.model_name)
+
+    def _update_tray(self, state, model=None):
+        if self.tray:
+            self.tray.update(state, model=model)
 
     def _start_model_load(self, model_name):
         self.model_name = model_name
@@ -127,6 +236,7 @@ class Dictation:
         self.model_loaded.clear()
         print(f"Loading Whisper model ({model_name})...")
         self.notify("Loading model...", f"{model_name}", "emblem-synchronizing", 5000)
+        self._update_tray("loading", model=model_name)
         threading.Thread(target=self._load_model, daemon=True).start()
 
     def _load_model(self):
@@ -139,12 +249,14 @@ class Dictation:
             print(f"Hold [{hotkey_name}] + 1=base, 2=small, 3=medium, 4=large-v3")
             print("Press Ctrl+C to quit.")
             self.notify("Ready!", f"Model: {self.model_name}", "emblem-ok-symbolic", 3000)
+            self._update_tray("ready", model=self.model_name)
         except Exception as e:
             self.model_error = str(e)
             self.model_loaded.set()
             print(f"Failed to load model: {e}")
             if "cudnn" in str(e).lower() or "cuda" in str(e).lower():
                 print("Hint: Try setting device = cpu in your config, or install cuDNN.")
+            self._update_tray("error")
 
     def switch_model(self, model_name):
         if model_name == self.model_name:
@@ -234,6 +346,7 @@ class Dictation:
         print("Recording...")
         hotkey_name = ecodes.KEY.get(HOTKEY, str(HOTKEY))
         self.notify("Recording...", f"Release {hotkey_name} when done", "audio-input-microphone", 30000)
+        self._update_tray("recording")
 
     def stop_recording(self):
         if not self.recording:
@@ -248,6 +361,7 @@ class Dictation:
 
         print("Transcribing...")
         self.notify("Transcribing...", "Processing your speech", "emblem-synchronizing", 30000)
+        self._update_tray("transcribing")
 
         # Wait for model if not loaded yet
         self.model_loaded.wait()
@@ -255,6 +369,7 @@ class Dictation:
         if self.model_error:
             print(f"Cannot transcribe: model failed to load")
             self.notify("Error", "Model failed to load", "dialog-error", 3000)
+            self._update_tray("error")
             return
 
         # Transcribe
@@ -307,12 +422,19 @@ class Dictation:
                 self.notify("No speech detected", "Try speaking louder", "dialog-warning", 2000)
 
         except Exception as e:
-            print(f"Error: {e}")
+            tb = traceback.format_exc()
+            print(f"Error: {e}\n{tb}")
+            # Write traceback to file for debugging
+            log_path = Path.home() / ".local" / "share" / "soupawhisper" / "error.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a") as f:
+                f.write(f"--- {datetime.now().isoformat()} ---\n{tb}\n")
             self.notify("Error", str(e)[:50], "dialog-error", 3000)
         finally:
             # Cleanup temp file
             if self.temp_file and os.path.exists(self.temp_file.name):
                 os.unlink(self.temp_file.name)
+            self._update_tray("ready")
 
     def _find_keyboards(self):
         """Find keyboard-only input devices, excluding mice/touchpads."""
@@ -345,7 +467,10 @@ class Dictation:
     def stop(self):
         print("\nExiting...")
         self.running = False
-        os._exit(0)
+        if self.tray:
+            GLib.idle_add(Gtk.main_quit)
+        else:
+            os._exit(0)
 
     def run(self):
         keyboards = self._find_keyboards()
@@ -384,6 +509,7 @@ class Dictation:
                                 if self.temp_file and os.path.exists(self.temp_file.name):
                                     os.unlink(self.temp_file.name)
                                 print("Recording cancelled.")
+                                self._update_tray("ready")
                             self.switch_model(MODEL_SLOTS[event.code])
                 except OSError:
                     # Device disconnected
@@ -462,6 +588,11 @@ def main():
         "-o", "--output",
         help="Save transcription to a text file instead of printing"
     )
+    parser.add_argument(
+        "--no-tray",
+        action="store_true",
+        help="Disable system tray icon"
+    )
     args = parser.parse_args()
 
     print(f"SoupaWhisper v{__version__}")
@@ -483,7 +614,22 @@ def main():
 
     signal.signal(signal.SIGINT, handle_sigint)
 
-    dictation.run()
+    use_tray = not args.no_tray and _init_tray()
+
+    if use_tray:
+        dictation.tray = TrayIcon(dictation)
+        # Run evdev loop in a background thread; GTK main loop takes the main thread
+        evdev_thread = threading.Thread(target=dictation.run, daemon=True)
+        evdev_thread.start()
+        print("Tray icon active.")
+        Gtk.main()
+        # GTK main loop exited — clean up
+        dictation.running = False
+        os._exit(0)
+    else:
+        if not TRAY_AVAILABLE and not args.no_tray:
+            print("Tray icon unavailable (install python3-gi + gir1.2-ayatanaappindicator3-0.1)")
+        dictation.run()
 
 
 if __name__ == "__main__":
