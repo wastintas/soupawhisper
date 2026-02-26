@@ -166,6 +166,10 @@ class TrayIcon:
         models_item.set_submenu(models_menu)
         menu.append(models_item)
 
+        history_item = Gtk.MenuItem(label="History")
+        history_item.connect("activate", self._on_history)
+        menu.append(history_item)
+
         menu.append(Gtk.SeparatorMenuItem())
 
         quit_item = Gtk.MenuItem(label="Quit")
@@ -198,6 +202,9 @@ class TrayIcon:
             return False
         GLib.idle_add(_do_update)
 
+    def _on_history(self, widget):
+        HistoryWindow().win.show_all()
+
     def _on_model_select(self, widget, model_name):
         threading.Thread(
             target=self.dictation.switch_model, args=(model_name,), daemon=True
@@ -206,6 +213,122 @@ class TrayIcon:
     def _on_quit(self, widget):
         self.dictation.running = False
         Gtk.main_quit()
+
+
+class HistoryWindow:
+    """Window showing transcription history with click-to-copy."""
+
+    def __init__(self):
+        self.win = Gtk.Window(title="SoupaWhisper - History")
+        self.win.set_default_size(600, 500)
+        self.win.set_position(Gtk.WindowPosition.CENTER)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.win.add(vbox)
+
+        # Scrollable list
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scrolled.set_vexpand(True)
+        vbox.pack_start(scrolled, True, True, 0)
+
+        self.listbox = Gtk.ListBox()
+        self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.listbox.connect("row-activated", self._on_row_activated)
+        scrolled.add(self.listbox)
+
+        # Bottom bar
+        bottom = Gtk.Box(spacing=8)
+        bottom.set_margin_start(8)
+        bottom.set_margin_end(8)
+        bottom.set_margin_top(4)
+        bottom.set_margin_bottom(4)
+
+        self.count_label = Gtk.Label()
+        self.count_label.set_halign(Gtk.Align.START)
+        bottom.pack_start(self.count_label, True, True, 0)
+
+        self.copy_hint = Gtk.Label(label="Click a row to copy")
+        self.copy_hint.set_halign(Gtk.Align.END)
+        self.copy_hint.set_opacity(0.5)
+        bottom.pack_end(self.copy_hint, False, False, 0)
+
+        vbox.pack_end(bottom, False, False, 0)
+
+        self._load_history()
+
+    def _load_history(self):
+        entries = []
+        if HISTORY_PATH.exists():
+            with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            entries.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+
+        # Most recent first
+        entries.reverse()
+
+        for entry in entries:
+            row = self._make_row(entry)
+            self.listbox.add(row)
+
+        self.count_label.set_text(f"{len(entries)} transcriptions")
+
+    def _make_row(self, entry):
+        row = Gtk.ListBoxRow()
+        row._text = entry.get("text", "")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.set_margin_start(10)
+        box.set_margin_end(10)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+
+        # Header: timestamp | duration | model
+        ts = entry.get("timestamp", "")
+        try:
+            dt = datetime.fromisoformat(ts)
+            ts_display = dt.strftime("%d/%m/%Y %H:%M")
+        except (ValueError, TypeError):
+            ts_display = ts
+
+        dur = entry.get("duration", 0)
+        model = entry.get("model", "?")
+        header = Gtk.Label(label=f"{ts_display}   {dur}s   {model}")
+        header.set_halign(Gtk.Align.START)
+        header.set_opacity(0.6)
+        box.pack_start(header, False, False, 0)
+
+        # Text (truncated for display)
+        text = entry.get("text", "")
+        display_text = text[:200] + "..." if len(text) > 200 else text
+        label = Gtk.Label(label=display_text)
+        label.set_halign(Gtk.Align.START)
+        label.set_line_wrap(True)
+        label.set_max_width_chars(70)
+        label.set_selectable(False)
+        box.pack_start(label, False, False, 0)
+
+        row.add(box)
+        return row
+
+    def _on_row_activated(self, listbox, row):
+        text = getattr(row, '_text', '')
+        if not text:
+            return
+        is_wayland = os.environ.get("XDG_SESSION_TYPE") == "wayland"
+        if is_wayland:
+            proc = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
+            proc.communicate(input=text.encode("utf-8"))
+        else:
+            proc = subprocess.Popen(["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE)
+            proc.communicate(input=text.encode("utf-8"))
+        self.copy_hint.set_text("Copied!")
+        GLib.timeout_add(2000, lambda: self.copy_hint.set_text("Click a row to copy") or False)
 
 
 class Dictation:
