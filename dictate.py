@@ -527,12 +527,12 @@ class Dictation:
                     )
                     process.communicate(input=text.encode())
 
-                # Auto-paste using dotool (works on Wayland/X11)
+                # Auto-paste using dotoolc via dotoold pipe (works on Wayland/X11)
                 if AUTO_TYPE:
                     import time
                     time.sleep(0.3)
                     subprocess.run(
-                        ["dotool"],
+                        ["dotoolc"],
                         input=b"key ctrl+v",
                         capture_output=True
                     )
