@@ -18,6 +18,7 @@ var/
 wheels/
 *.egg-info/
 *.egg
+.env
 
 # Virtual environments
 .venv/

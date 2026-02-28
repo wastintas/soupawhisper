@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "soupawhisper"
-version = "0.2.0"
-description = "Push-to-talk voice dictation for Linux (Wayland) using faster-whisper"
+version = "0.1.0"
+description = "Push-to-talk voice dictation for Linux using faster-whisper"
 authors = ["Kyle <kyle@ksred.com>"]
 license = "MIT"
 readme = "README.md"
@@ -9,22 +9,19 @@ repository = "https://github.com/ksred/soupawhisper"
 keywords = ["whisper", "dictation", "voice", "transcription", "speech-to-text"]
 classifiers = [
     "Development Status :: 4 - Beta",
-    "Environment :: Console",
+    "Environment :: X11 Applications",
     "Intended Audience :: End Users/Desktop",
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
     "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]
-packages = [{include = "soupawhisper"}]
-
-[tool.poetry.scripts]
-soupawhisper = "soupawhisper.__main__:main"
+package-mode = false
 
 [tool.poetry.dependencies]
-python = "^3.12"
+python = "^3.10"
 faster-whisper = "^1.0.0"
 evdev = "^1.6.0"
 
